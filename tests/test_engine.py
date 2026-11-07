@@ -73,6 +73,36 @@ class EngineTest(unittest.TestCase):
         with self.assertRaises(app.SafetyError):
             app.transfer(s, src, dst, 'copy', self.jobs)
 
+    def test_newer_source_replaces_older_destination_and_undo_restores(self):
+        old = json.dumps({'sessionId': RID, 'cliSessionId': SID, 'title': 'old',
+                          'lastActivityAt': '2026-01-01T00:00:00Z'})
+        (self.dst / self.card.name).write_text(old)
+        self.card.write_text(json.dumps({'sessionId': RID, 'cliSessionId': SID, 'title': 'new',
+                                         'lastActivityAt': '2026-02-01T00:00:00Z'}))
+        src, dst, s = self.scan()
+        receipt = app.transfer(s, src, dst, 'copy', self.jobs)
+        self.assertEqual(receipt['done'], 1)
+        self.assertEqual(app.filehash(self.dst / self.card.name), app.filehash(self.card))
+        undo = app.undo_job(receipt['job'])
+        self.assertEqual(undo['errors'], [])
+        self.assertEqual((self.dst / self.card.name).read_text(), old)
+
+    def test_later_focus_breaks_activity_tie(self):
+        base = {'sessionId': RID, 'cliSessionId': SID, 'lastActivityAt': 1793772081418}
+        (self.dst / self.card.name).write_text(json.dumps({**base, 'lastFocusedAt': 1793771992496}))
+        self.card.write_text(json.dumps({**base, 'lastFocusedAt': 1793813059032}))
+        src, dst, s = self.scan()
+        self.assertEqual(app.transfer(s, src, dst, 'copy', self.jobs)['done'], 1)
+
+    def test_older_source_does_not_replace_newer_destination(self):
+        (self.dst / self.card.name).write_text(json.dumps({'sessionId': RID, 'cliSessionId': SID,
+                                                           'lastActivityAt': 1893456000000}))
+        self.card.write_text(json.dumps({'sessionId': RID, 'cliSessionId': SID,
+                                         'lastActivityAt': 1767225600000}))
+        src, dst, s = self.scan()
+        with self.assertRaises(app.SafetyError):
+            app.transfer(s, src, dst, 'copy', self.jobs)
+
     def test_bad_json_and_missing_transcript(self):
         self.card.write_text('{broken')
         _, _, s = self.scan()

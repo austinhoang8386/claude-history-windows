@@ -159,21 +159,50 @@ def transcript_ids(base: Path) -> set[str]:
     return found
 
 
-def date_label(record: dict, file: Path) -> str:
+def activity_ts(record: dict, file: Path) -> float:
+    """Last activity as a Unix timestamp; falls back to the card's mtime."""
     raw = record.get('lastActivityAt') or record.get('createdAt')
-    if isinstance(raw, (float, int)):
-        try:
-            if raw > 1e12:
-                raw /= 1000
-            return dt.datetime.fromtimestamp(raw).strftime('%Y-%m-%d %H:%M')
-        except (OverflowError, OSError, ValueError):
-            pass
+    if isinstance(raw, (float, int)) and not isinstance(raw, bool):
+        return raw / 1000 if raw > 1e12 else float(raw)
     if isinstance(raw, str):
         try:
-            return dt.datetime.fromisoformat(raw.replace('Z', '+00:00')).strftime('%Y-%m-%d %H:%M')
+            return dt.datetime.fromisoformat(raw.replace('Z', '+00:00')).timestamp()
         except ValueError:
             pass
-    return dt.datetime.fromtimestamp(file.stat().st_mtime).strftime('%Y-%m-%d %H:%M')
+    return file.stat().st_mtime
+
+
+def date_label(record: dict, file: Path) -> str:
+    try:
+        return dt.datetime.fromtimestamp(activity_ts(record, file)).strftime('%Y-%m-%d %H:%M')
+    except (OverflowError, OSError, ValueError):
+        return dt.datetime.fromtimestamp(file.stat().st_mtime).strftime('%Y-%m-%d %H:%M')
+
+
+def _card_activity(path: Path) -> float:
+    try:
+        data = json.loads(path.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError, UnicodeError):
+        raise SafetyError(tr('dest_invalid', filename=path.name))
+    data = data if isinstance(data, dict) else {}
+    # Opening a session updates lastFocusedAt but not lastActivityAt, so count both.
+    focused = data.get('lastFocusedAt')
+    focused_ts = activity_ts({'lastActivityAt': focused}, path) if focused else 0.0
+    return max(activity_ts(data, path), focused_ts)
+
+
+def _replace_file(src: Path, target: Path):
+    """Atomically overwrite target with src's bytes (temp file in the same folder, then os.replace)."""
+    fd, tmpname = tempfile.mkstemp(prefix='.journal-', suffix='.tmp', dir=target.parent)
+    try:
+        with os.fdopen(fd, 'wb') as fw, src.open('rb') as fr:
+            shutil.copyfileobj(fr, fw)
+            fw.flush()
+            os.fsync(fw.fileno())
+        os.replace(tmpname, target)
+    finally:
+        if os.path.exists(tmpname):
+            os.unlink(tmpname)
 
 
 def load_sessions(account: Account, transcripts: set[str]) -> list[Session]:
@@ -290,9 +319,18 @@ def _ordered_plan(selected: Iterable[Session], source: Account, dest: Account) -
     for s in sessions:
         target = dest.folder / s.path.name
         if target.exists():
-            if not target.is_file() or target.is_symlink() or filehash(target) != s.sha:
+            if not target.is_file() or target.is_symlink():
                 raise SafetyError(tr('same_id_conflict', filename=target.name))
-            skipped += 1  # No changes to either side.
+            if filehash(target) == s.sha:
+                skipped += 1  # No changes to either side.
+                continue
+            # Same session, different content: the newer card wins (account-switch sync).
+            if _card_activity(s.path) <= _card_activity(target):
+                raise SafetyError(tr('same_id_conflict', filename=target.name))
+            if dest_cli.get(s.cli_id, target.name) != target.name or s.cli_id in pending_cli:
+                raise SafetyError(tr('same_cli_conflict', cli_id=s.cli_id))
+            pending_cli.add(s.cli_id)
+            todo[s.record_id] = s
         else:
             if s.cli_id in dest_cli or s.cli_id in pending_cli:
                 raise SafetyError(tr('same_cli_conflict', cli_id=s.cli_id))
@@ -346,6 +384,10 @@ def transfer(selected: Iterable[Session], source: Account, dest: Account, mode: 
             {'filename': s.path.name, 'sha256': s.sha, 'status': 'planned'} for s in plan
         ],
     }
+    for item in manifest['items']:
+        existing = dest.folder / item['filename']
+        if existing.exists():
+            item['replaced_sha256'] = filehash(existing)  # Older destination card being overwritten.
     _save_manifest(job, manifest)
     try:
         # Backup ALL chosen cards before writing to the target.
@@ -355,19 +397,30 @@ def transfer(selected: Iterable[Session], source: Account, dest: Account, mode: 
             shutil.copy2(s.path, backup)
             if filehash(backup) != s.sha:
                 raise SafetyError(tr('backup_hash_mismatch', filename=s.path.name))
+        (job / 'backup-dest').mkdir()
+        for item in manifest['items']:
+            if 'replaced_sha256' in item:
+                backup = job / 'backup-dest' / item['filename']
+                shutil.copy2(dest.folder / item['filename'], backup)
+                if filehash(backup) != item['replaced_sha256']:
+                    raise SafetyError(tr('backup_hash_mismatch', filename=item['filename']))
         manifest['state'] = 'backed_up'
         _save_manifest(job, manifest)
         for i, s in enumerate(plan):
             target = dest.folder / s.path.name
-            if target.exists():
+            replaced = manifest['items'][i].get('replaced_sha256')
+            if target.exists() and (not replaced or filehash(target) != replaced):
                 raise SafetyError(tr('dest_appeared', filename=target.name))
             if filehash(s.path) != s.sha:
                 raise SafetyError(tr('source_changed_transfer'))
-            # Exclusive creation prevents accidental overwrite and makes rollback verifiable.
-            with s.path.open('rb') as fr, target.open('xb') as fw:
-                shutil.copyfileobj(fr, fw)
-                fw.flush()
-                os.fsync(fw.fileno())
+            if replaced:
+                _replace_file(s.path, target)  # Old card is verified in backup-dest for undo.
+            else:
+                # Exclusive creation prevents accidental overwrite and makes rollback verifiable.
+                with s.path.open('rb') as fr, target.open('xb') as fw:
+                    shutil.copyfileobj(fr, fw)
+                    fw.flush()
+                    os.fsync(fw.fileno())
             if filehash(target) != s.sha:
                 raise SafetyError(tr('target_hash_mismatch'))
             manifest['items'][i]['status'] = 'copied'
@@ -416,13 +469,15 @@ def undo_job(job: Path) -> dict:
         original = src / filename
         target = dst / filename
         backup = job / 'backup-source' / filename
+        replaced = entry.get('replaced_sha256')
         try:
             # Planned records may have been copied just before a crash; inspect the target.
             if backup.exists() and filehash(backup) != sha:
                 raise SafetyError(tr('backup_changed'))
             if original.exists() and (original.is_symlink() or filehash(original) != sha):
                 raise SafetyError(tr('source_edited_undo'))
-            if target.exists() and (target.is_symlink() or filehash(target) != sha):
+            target_sha = filehash(target) if target.exists() and not target.is_symlink() else None
+            if target.exists() and target_sha not in (sha, replaced):
                 raise SafetyError(tr('target_edited_undo'))
             if receipt['mode'] == 'move' and not original.exists():
                 if not backup.exists():
@@ -434,7 +489,13 @@ def undo_job(job: Path) -> dict:
                 if filehash(original) != sha:
                     raise SafetyError(tr('restored_hash_bad'))
                 restored += 1
-            if target.exists():
+            if replaced and target_sha == sha:
+                old = job / 'backup-dest' / filename
+                if not old.exists() or filehash(old) != replaced:
+                    raise SafetyError(tr('backup_absent'))
+                _replace_file(old, target)  # Put the older destination card back.
+                removed += 1
+            elif not replaced and target.exists():
                 target.unlink()
                 removed += 1
             entry['status'] = 'undone'

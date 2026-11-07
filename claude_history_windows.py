@@ -1,6 +1,6 @@
 """Claude History Transfer for Windows — local-only Claude Desktop Code session card migration.
 
-No external dependencies. Python 3.10+. Windows 10/11 Tkinter GUI.
+Python 3.10+ and wxPython (native, screen-reader accessible controls). Windows 10/11.
 Not affiliated with Anthropic or claude-transplant. No cloud or account authentication.
 """
 from __future__ import annotations
@@ -16,8 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+import wx
 from dataclasses import dataclass
 from typing import Iterable
 from localization import LANGUAGE_OPTIONS, set_language, get_language, tr
@@ -463,166 +462,194 @@ def last_undoable_job(jobs: Path = JOBS_HOME) -> Path | None:
     return None
 
 
-class TransferGUI(tk.Tk):
+class TransferGUI(wx.Frame):
+    """wxPython GUI: native Win32 controls, so NVDA/JAWS/Narrator can read and drive every widget."""
+
     def __init__(self):
-        super().__init__()
         set_language(read_saved_language(SETTINGS_FILE))
-        self.title(APP_NAME + '  ' + VERSION)
-        self.geometry('1150x730')
-        self.minsize(950, 575)
-        self.configure(bg='#f5f6f9')
-        style = ttk.Style(self)
-        if 'vista' in style.theme_names():
-            style.theme_use('vista')
+        super().__init__(None, title=APP_NAME + '  ' + VERSION, size=(1150, 730))
+        self.SetMinSize((950, 575))
         self.roots: list[Path] = []
         self.accts: list[Account] = []
         self.sessions: list[Session] = []
+        self.shown: list[Session] = []
         self.checked: set[str] = set()
-        self.localized_widgets: list[tuple[tk.Widget, str]] = []
-        self.root_text = tk.StringVar()
-        self.src_text = tk.StringVar()
-        self.dst_text = tk.StringVar()
-        self.filter_text = tk.StringVar()
-        self.status_text = tk.StringVar(value=tr('ready'))
-        self.info_text = tk.StringVar()
-        self.language_text = tk.StringVar(value='Tiếng Việt' if get_language() == 'vi' else 'English')
+        self.localized_widgets: list[tuple[wx.Window, str]] = []
+        self._populating = False
         self.build_ui()
         self.refresh_roots()
 
     def localize(self, widget, key: str):
-        widget.configure(text=tr(key))
+        widget.SetLabel(tr(key))
         self.localized_widgets.append((widget, key))
         return widget
 
+    def show(self, message: str, title: str, flags=wx.OK | wx.ICON_INFORMATION) -> int:
+        return wx.MessageBox(message, title, flags, self)
+
     def change_language(self, _event=None):
-        language = LANGUAGE_OPTIONS.get(self.language_text.get(), 'en')
+        language = list(LANGUAGE_OPTIONS.values())[self.lang_box.GetSelection()]
         if language == get_language():
             return
         set_language(language)
         try:
             save_language(language, SETTINGS_FILE)
         except OSError as exc:
-            messagebox.showwarning(APP_NAME, str(exc))
+            self.show(str(exc), APP_NAME, wx.OK | wx.ICON_WARNING)
         for widget, key in self.localized_widgets:
-            widget.configure(text=tr(key))
-        for key in ('mark', 'title', 'project', 'date', 'status'):
-            self.table.heading(key, text=tr('column_' + key))
-        # Preserve index because changing Combobox values may clear the selection.
-        old_src, old_dst = self.src_box.current(), self.dst_box.current()
-        self.src_box['values'] = [a.label for a in self.accts]
-        self.dst_box['values'] = [a.label for a in self.accts]
+            widget.SetLabel(tr(key))
+        for i, key in enumerate(self.columns):
+            col = self.table.GetColumn(i)
+            col.SetText(tr('column_' + key))
+            self.table.SetColumn(i, col)
+        old_src, old_dst = self.src_box.GetSelection(), self.dst_box.GetSelection()
+        self.set_account_choices()
         if 0 <= old_src < len(self.accts):
-            self.src_box.current(old_src)
+            self.src_box.SetSelection(old_src)
         if 0 <= old_dst < len(self.accts):
-            self.dst_box.current(old_dst)
+            self.dst_box.SetSelection(old_dst)
         src, _ = self.current_accounts()
         if src:
             ids = transcript_ids(Path.home() / '.claude' / 'projects')
             self.sessions = load_sessions(src, ids)
             self.sessions.sort(key=lambda s: s.latest, reverse=True)
         self.populate_table()  # Preserve checkboxes and filter while translating reasons.
-        self.status_text.set(tr('ready'))
+        self.status.SetLabel(tr('ready'))
+        self.panel.Layout()
 
     def build_ui(self):
-        header = tk.Frame(self, bg='#25314b', height=76)
-        header.pack(fill='x')
-        title_area = tk.Frame(header, bg='#25314b')
-        title_area.pack(side='left', fill='x', expand=True)
-        tk.Label(title_area, text='CLAUDE HISTORY TRANSFER', fg='white', bg='#25314b',
-                 font=('Segoe UI', 17, 'bold')).pack(anchor='w', padx=22, pady=(12, 0))
-        self.localize(tk.Label(title_area, fg='#c9d7eb', bg='#25314b',
-                               font=('Segoe UI', 9)), 'app_subtitle').pack(anchor='w', padx=23)
-        lang_area = tk.Frame(header, bg='#25314b')
-        lang_area.pack(side='right', padx=20, pady=19)
-        self.localize(tk.Label(lang_area, fg='#c9d7eb', bg='#25314b'), 'language').pack(side='left', padx=(0, 6))
-        lang_box = ttk.Combobox(lang_area, values=list(LANGUAGE_OPTIONS),
-                                textvariable=self.language_text, state='readonly', width=13)
-        lang_box.pack(side='left')
-        lang_box.bind('<<ComboboxSelected>>', self.change_language)
+        self.panel = panel = wx.Panel(self)  # wx.Panel gives Tab/Shift+Tab keyboard traversal.
+        outer = wx.BoxSizer(wx.VERTICAL)
 
-        body = ttk.Frame(self, padding=(18, 14))
-        body.pack(fill='both', expand=True)
+        header = wx.Panel(panel)
+        header.SetBackgroundColour('#25314b')
+        hs = wx.BoxSizer(wx.HORIZONTAL)
+        titles = wx.BoxSizer(wx.VERTICAL)
+        title = wx.StaticText(header, label='CLAUDE HISTORY TRANSFER')
+        title.SetFont(wx.Font(17, wx.FONTFAMILY_SWISS, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD, faceName='Segoe UI'))
+        title.SetForegroundColour('white')
+        subtitle = self.localize(wx.StaticText(header), 'app_subtitle')
+        subtitle.SetForegroundColour('#c9d7eb')
+        titles.Add(title, 0, wx.LEFT | wx.TOP, 12)
+        titles.Add(subtitle, 0, wx.LEFT | wx.BOTTOM, 12)
+        hs.Add(titles, 1, wx.EXPAND)
+        # Each StaticText is created right before its control: Windows uses it as the control's accessible name.
+        lang_label = self.localize(wx.StaticText(header), 'language')
+        lang_label.SetForegroundColour('#c9d7eb')
+        self.lang_box = wx.Choice(header, choices=list(LANGUAGE_OPTIONS))
+        self.lang_box.SetSelection(list(LANGUAGE_OPTIONS.values()).index(get_language()))
+        self.lang_box.Bind(wx.EVT_CHOICE, self.change_language)
+        hs.Add(lang_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        hs.Add(self.lang_box, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 20)
+        header.SetSizer(hs)
+        outer.Add(header, 0, wx.EXPAND)
 
-        location = self.localize(ttk.LabelFrame(body, padding=10), 'root_group')
-        location.pack(fill='x', pady=(0, 10))
-        self.root_box = ttk.Combobox(location, textvariable=self.root_text, state='readonly')
-        self.root_box.pack(side='left', fill='x', expand=True, padx=(0, 8))
-        self.root_box.bind('<<ComboboxSelected>>', lambda _: self.refresh_accounts())
-        self.localize(ttk.Button(location, command=self.pick_root), 'browse').pack(side='left', padx=3)
-        self.localize(ttk.Button(location, command=self.refresh_roots), 'rescan').pack(side='left', padx=3)
+        body = wx.BoxSizer(wx.VERTICAL)
 
-        account = self.localize(ttk.LabelFrame(body, padding=10), 'accounts_group')
-        account.pack(fill='x', pady=(0, 10))
-        account.columnconfigure(1, weight=1)
-        account.columnconfigure(3, weight=1)
-        ttk.Label(account, text='FROM').grid(row=0, column=0, sticky='w', padx=(0, 8))
-        self.src_box = ttk.Combobox(account, textvariable=self.src_text, state='readonly')
-        self.src_box.grid(row=0, column=1, sticky='ew', padx=(0, 16))
-        self.src_box.bind('<<ComboboxSelected>>', lambda _: self.refresh_sessions())
-        ttk.Label(account, text='TO').grid(row=0, column=2, sticky='w', padx=(0, 8))
-        self.dst_box = ttk.Combobox(account, textvariable=self.dst_text, state='readonly')
-        self.dst_box.grid(row=0, column=3, sticky='ew')
-        self.localize(ttk.Label(account, foreground='#606778'), 'account_help').grid(
-            row=1, column=0, columnspan=4, sticky='w', pady=(7, 0))
+        # Controls are children of their StaticBox so screen readers announce the group name.
+        location = wx.StaticBoxSizer(wx.HORIZONTAL, panel)
+        box = self.localize(location.GetStaticBox(), 'root_group')
+        self.root_box = wx.Choice(box)
+        self.root_box.Bind(wx.EVT_CHOICE, lambda _: self.refresh_accounts())
+        browse = self.localize(wx.Button(box), 'browse')
+        browse.Bind(wx.EVT_BUTTON, lambda _: self.pick_root())
+        rescan = self.localize(wx.Button(box), 'rescan')
+        rescan.Bind(wx.EVT_BUTTON, lambda _: self.refresh_roots())
+        location.Add(self.root_box, 1, wx.EXPAND | wx.ALL, 6)
+        location.Add(browse, 0, wx.ALL, 6)
+        location.Add(rescan, 0, wx.ALL, 6)
+        body.Add(location, 0, wx.EXPAND | wx.BOTTOM, 10)
 
-        listing = self.localize(ttk.LabelFrame(body, padding=10), 'sessions_group')
-        listing.pack(fill='both', expand=True)
-        toolbar = ttk.Frame(listing)
-        toolbar.pack(fill='x', pady=(0, 8))
-        self.localize(ttk.Label(toolbar), 'search').pack(side='left')
-        query = ttk.Entry(toolbar, textvariable=self.filter_text, width=35)
-        query.pack(side='left', fill='x', expand=True, padx=9)
-        self.filter_text.trace_add('write', lambda *_: self.populate_table())
-        self.localize(ttk.Button(toolbar, command=self.select_all), 'select_all').pack(side='left', padx=4)
-        self.localize(ttk.Button(toolbar, command=self.deselect_all), 'deselect').pack(side='left', padx=4)
+        account = wx.StaticBoxSizer(wx.VERTICAL, panel)
+        box = self.localize(account.GetStaticBox(), 'accounts_group')
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(box, label='FROM'), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        self.src_box = wx.Choice(box)
+        self.src_box.Bind(wx.EVT_CHOICE, lambda _: self.refresh_sessions())
+        row.Add(self.src_box, 1, wx.RIGHT, 16)
+        row.Add(wx.StaticText(box, label='TO'), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        self.dst_box = wx.Choice(box)
+        row.Add(self.dst_box, 1)
+        account.Add(row, 0, wx.EXPAND | wx.ALL, 6)
+        account_help = self.localize(wx.StaticText(box), 'account_help')
+        account_help.SetForegroundColour('#4a5160')
+        account.Add(account_help, 0, wx.ALL, 6)
+        body.Add(account, 0, wx.EXPAND | wx.BOTTOM, 10)
 
-        tree_frame = ttk.Frame(listing)
-        tree_frame.pack(fill='both', expand=True)
-        cols = ('mark', 'title', 'project', 'date', 'status')
-        self.table = ttk.Treeview(tree_frame, columns=cols, show='headings', selectmode='browse')
-        for key in cols:
-            self.table.heading(key, text=tr('column_' + key))
-        for key, size, stretch in [('mark', 45, False), ('title', 280, True), ('project', 280, True),
-                                   ('date', 140, False), ('status', 180, False)]:
-            self.table.column(key, width=size, minwidth=35, stretch=stretch)
-        self.table.tag_configure('blocked', foreground='#aa4e4e')
-        ys = ttk.Scrollbar(tree_frame, orient='vertical', command=self.table.yview)
-        self.table.configure(yscrollcommand=ys.set)
-        self.table.pack(side='left', fill='both', expand=True)
-        ys.pack(side='right', fill='y')
-        self.table.bind('<ButtonRelease-1>', self.on_row_click)
-        self.table.bind('<Double-1>', self.on_row_click)
-        ttk.Label(listing, textvariable=self.info_text, foreground='#566071').pack(anchor='w', pady=(7, 0))
+        listing = wx.StaticBoxSizer(wx.VERTICAL, panel)
+        box = self.localize(listing.GetStaticBox(), 'sessions_group')
+        toolbar = wx.BoxSizer(wx.HORIZONTAL)
+        toolbar.Add(self.localize(wx.StaticText(box), 'search'), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.query = wx.TextCtrl(box)
+        self.query.Bind(wx.EVT_TEXT, lambda _: self.populate_table())
+        toolbar.Add(self.query, 1, wx.LEFT | wx.RIGHT, 9)
+        select_all = self.localize(wx.Button(box), 'select_all')
+        select_all.Bind(wx.EVT_BUTTON, lambda _: self.select_all())
+        deselect = self.localize(wx.Button(box), 'deselect')
+        deselect.Bind(wx.EVT_BUTTON, lambda _: self.deselect_all())
+        toolbar.Add(select_all, 0, wx.LEFT | wx.RIGHT, 4)
+        toolbar.Add(deselect, 0, wx.LEFT, 4)
+        listing.Add(toolbar, 0, wx.EXPAND | wx.ALL, 6)
 
-        footer = ttk.Frame(body)
-        footer.pack(fill='x', pady=(11, 0))
-        self.localize(ttk.Button(footer, command=lambda: self.execute('copy')), 'copy_button').pack(side='left', padx=(0, 8))
-        self.localize(ttk.Button(footer, command=lambda: self.execute('move')), 'move_button').pack(side='left', padx=(0, 8))
-        self.localize(ttk.Button(footer, command=self.undo), 'undo_button').pack(side='left')
-        ttk.Label(footer, textvariable=self.status_text, foreground='#4c5d73').pack(side='right')
-        self.localize(ttk.Label(body, foreground='#8d4a35'), 'scope_notice').pack(anchor='w', pady=(9, 0))
+        # Native list view with checkboxes: Space toggles, screen readers announce "checked"/"not checked".
+        # Its label sits right before it so the list gets an accessible name.
+        listing.Add(self.localize(wx.StaticText(box), 'sessions_group'), 0, wx.LEFT, 6)
+        self.table = wx.ListCtrl(box, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.table.EnableCheckBoxes()
+        self.columns = ('title', 'project', 'date', 'status')
+        for i, (key, size) in enumerate(zip(self.columns, (300, 300, 140, 260))):
+            self.table.InsertColumn(i, tr('column_' + key), width=size)
+        self.table.Bind(wx.EVT_LIST_ITEM_CHECKED, self.on_check)
+        self.table.Bind(wx.EVT_LIST_ITEM_UNCHECKED, self.on_check)
+        listing.Add(self.table, 1, wx.EXPAND | wx.ALL, 6)
+        self.info = wx.StaticText(box)
+        listing.Add(self.info, 0, wx.ALL, 6)
+        body.Add(listing, 1, wx.EXPAND)
+
+        footer = wx.BoxSizer(wx.HORIZONTAL)
+        for key, handler in (('copy_button', lambda _: self.execute('copy')),
+                             ('move_button', lambda _: self.execute('move')),
+                             ('undo_button', lambda _: self.undo())):
+            button = self.localize(wx.Button(panel), key)
+            button.Bind(wx.EVT_BUTTON, handler)
+            footer.Add(button, 0, wx.RIGHT, 8)
+        footer.AddStretchSpacer()
+        self.status = wx.StaticText(panel, label=tr('ready'))
+        footer.Add(self.status, 0, wx.ALIGN_CENTER_VERTICAL)
+        body.Add(footer, 0, wx.EXPAND | wx.TOP, 11)
+        notice = self.localize(wx.StaticText(panel), 'scope_notice')
+        notice.SetForegroundColour('#8d4a35')
+        body.Add(notice, 0, wx.TOP, 9)
+
+        outer.Add(body, 1, wx.EXPAND | wx.ALL, 16)
+        panel.SetSizer(outer)
+
+    def set_account_choices(self):
+        labels = [a.label for a in self.accts]
+        self.src_box.Set(labels)
+        self.dst_box.Set(labels)
 
     def current_root(self) -> Path | None:
-        idx = self.root_box.current()
+        idx = self.root_box.GetSelection()
         return self.roots[idx] if 0 <= idx < len(self.roots) else None
 
     def current_accounts(self) -> tuple[Account | None, Account | None]:
-        a, b = self.src_box.current(), self.dst_box.current()
+        a, b = self.src_box.GetSelection(), self.dst_box.GetSelection()
         return (self.accts[a] if 0 <= a < len(self.accts) else None,
                 self.accts[b] if 0 <= b < len(self.accts) else None)
 
     def pick_root(self):
-        folder = filedialog.askdirectory(title=tr('browse_title'))
-        if not folder:
-            return
-        path = Path(folder).resolve()
+        with wx.DirDialog(self, tr('browse_title')) as dialog:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            path = Path(dialog.GetPath()).resolve()
         if path.name != 'claude-code-sessions':
-            messagebox.showerror(tr('wrong_folder_title'), tr('wrong_folder'))
+            self.show(tr('wrong_folder'), tr('wrong_folder_title'), wx.OK | wx.ICON_ERROR)
             return
         if path not in self.roots:
             self.roots.append(path)
-        self.root_box['values'] = [str(p) for p in self.roots]
-        self.root_box.current(self.roots.index(path))
+        self.root_box.Set([str(p) for p in self.roots])
+        self.root_box.SetSelection(self.roots.index(path))
         self.refresh_accounts()
 
     def refresh_roots(self):
@@ -632,28 +659,25 @@ class TransferGUI(tk.Tk):
         for r in custom:
             if r not in self.roots:
                 self.roots.append(r)
-        self.root_box['values'] = [str(p) for p in self.roots]
+        self.root_box.Set([str(p) for p in self.roots])
         if not self.roots:
-            self.status_text.set(tr('no_root_status'))
+            self.status.SetLabel(tr('no_root_status'))
             self.accts = []
             self.sessions = []
+            self.set_account_choices()
             self.populate_table()
-            messagebox.showinfo(tr('no_root_title'), tr('no_root_message'))
+            self.show(tr('no_root_message'), tr('no_root_title'))
             return
-        self.root_box.current(self.roots.index(old) if old in self.roots else 0)
+        self.root_box.SetSelection(self.roots.index(old) if old in self.roots else 0)
         self.refresh_accounts()
 
     def refresh_accounts(self):
         root = self.current_root()
         self.accts = accounts_at(root) if root else []
-        labels = [a.label for a in self.accts]
-        self.src_box['values'] = labels
-        self.dst_box['values'] = labels
+        self.set_account_choices()
         if self.accts:
-            self.src_box.current(next((i for i,a in enumerate(self.accts) if a.count), 0))
-            self.dst_box.current(next((i for i,a in enumerate(self.accts) if i != self.src_box.current()), 0))
-        else:
-            self.src_text.set(''); self.dst_text.set('')
+            self.src_box.SetSelection(next((i for i, a in enumerate(self.accts) if a.count), 0))
+            self.dst_box.SetSelection(next((i for i, a in enumerate(self.accts) if i != self.src_box.GetSelection()), 0))
         self.refresh_sessions()
 
     def refresh_sessions(self):
@@ -663,44 +687,58 @@ class TransferGUI(tk.Tk):
             self.sessions = []
             self.populate_table()
             return
-        self.status_text.set(tr('scanning'))
-        self.update_idletasks()
+        self.status.SetLabel(tr('scanning'))
+        self.Update()
         try:
             ids = transcript_ids(Path.home() / '.claude' / 'projects')
             self.sessions = load_sessions(src, ids)
             self.sessions.sort(key=lambda s: s.latest, reverse=True)
         except Exception as exc:
-            messagebox.showerror(tr('scan_error'), str(exc))
+            self.show(str(exc), tr('scan_error'), wx.OK | wx.ICON_ERROR)
             self.sessions = []
         self.populate_table()
-        self.status_text.set(tr('scanned'))
+        self.status.SetLabel(tr('scanned'))
 
     def visible_sessions(self) -> list[Session]:
-        q = self.filter_text.get().lower().strip()
+        q = self.query.GetValue().lower().strip()
         return [s for s in self.sessions if not q or q in s.title.lower() or q in s.cwd.lower()]
 
-    def populate_table(self):
-        self.table.delete(*self.table.get_children())
-        for i, s in enumerate(self.visible_sessions()):
-            self.table.insert('', 'end', iid=str(i), values=(
-                '☑' if str(s.path) in self.checked else '☐', s.title,
-                s.cwd, s.latest, s.reason), tags=() if s.valid else ('blocked',))
+    def update_summary(self):
         count = sum(str(s.path) in self.checked for s in self.sessions)
         ready = sum(s.valid for s in self.sessions)
-        self.info_text.set(tr('table_summary', total=len(self.sessions), eligible=ready, selected=count))
+        self.info.SetLabel(tr('table_summary', total=len(self.sessions), eligible=ready, selected=count))
 
-    def on_row_click(self, event):
-        row = self.table.identify_row(event.y)
-        col = self.table.identify_column(event.x)
-        if row and col == '#1':
-            selected = self.visible_sessions()[int(row)]
-            if selected.valid:
-                key = str(selected.path)
-                if key in self.checked:
-                    self.checked.remove(key)
-                else:
-                    self.checked.add(key)
-                self.populate_table()
+    def populate_table(self):
+        self._populating = True  # CheckItem fires check events; ignore our own.
+        try:
+            self.table.DeleteAllItems()
+            self.shown = self.visible_sessions()
+            for i, s in enumerate(self.shown):
+                self.table.InsertItem(i, s.title)
+                for col, value in enumerate((s.cwd, s.latest, s.reason), start=1):
+                    self.table.SetItem(i, col, value)
+                if not s.valid:
+                    self.table.SetItemTextColour(i, wx.Colour('#aa4e4e'))  # Status column also states why.
+                self.table.CheckItem(i, str(s.path) in self.checked)
+        finally:
+            self._populating = False
+        self.update_summary()
+
+    def on_check(self, event):
+        if self._populating:
+            return
+        i = event.GetIndex()
+        s = self.shown[i]
+        if not s.valid:
+            # Blocked rows cannot be selected; revert the tick after the native toggle finishes.
+            wx.Bell()
+            wx.CallAfter(self.populate_table)
+            return
+        if self.table.IsItemChecked(i):
+            self.checked.add(str(s.path))
+        else:
+            self.checked.discard(str(s.path))
+        self.update_summary()
 
     def select_all(self):
         self.checked.update(str(s.path) for s in self.visible_sessions() if s.valid)
@@ -713,14 +751,14 @@ class TransferGUI(tk.Tk):
     def execute(self, mode: str):
         src, dst = self.current_accounts()
         if not src or not dst:
-            messagebox.showwarning(tr('account_missing_title'), tr('account_missing'))
+            self.show(tr('account_missing'), tr('account_missing_title'), wx.OK | wx.ICON_WARNING)
             return
         selected = [s for s in self.sessions if str(s.path) in self.checked]
         try:
             ensure_claude_closed()
             plan, skipped = _ordered_plan(selected, src, dst)
         except SafetyError as exc:
-            messagebox.showerror(tr('unsafe_title'), str(exc))
+            self.show(str(exc), tr('unsafe_title'), wx.OK | wx.ICON_ERROR)
             return
         verb = tr('copy_verb') if mode == 'copy' else tr('move_verb')
         message = tr('confirmation', verb=verb, count=len(plan), source=src.folder,
@@ -728,43 +766,45 @@ class TransferGUI(tk.Tk):
         if mode == 'move':
             message += tr('move_warning')
         if not plan:
-            messagebox.showinfo(tr('nothing_to_do_title'), tr('nothing_to_do'))
+            self.show(tr('nothing_to_do'), tr('nothing_to_do_title'))
             return
-        if not messagebox.askyesno(tr('confirm_title', verb=verb), message):
+        if self.show(message, tr('confirm_title', verb=verb),
+                     wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION) != wx.YES:
             return
         try:
             result = transfer(selected, src, dst, mode)
-            self.status_text.set(tr('complete_status', count=result['done']))
-            messagebox.showinfo(tr('complete_title'), tr('completed_message',
-                                verb=verb, done=result['done'], skipped=result['skipped'], job=result['job']))
+            self.status.SetLabel(tr('complete_status', count=result['done']))
+            self.show(tr('completed_message', verb=verb, done=result['done'],
+                         skipped=result['skipped'], job=result['job']), tr('complete_title'))
             self.refresh_accounts()
         except (OSError, SafetyError) as exc:
-            messagebox.showerror(tr('stopped'), str(exc))
+            self.show(str(exc), tr('stopped'), wx.OK | wx.ICON_ERROR)
             self.refresh_accounts()
 
     def undo(self):
         job = last_undoable_job()
         if not job:
-            messagebox.showinfo('Undo', tr('undo_none'))
+            self.show(tr('undo_none'), 'Undo')
             return
-        if not messagebox.askyesno(tr('confirm_undo'), tr('undo_confirmation', job=job)):
+        if self.show(tr('undo_confirmation', job=job), tr('confirm_undo'),
+                     wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION) != wx.YES:
             return
         try:
             result = undo_job(job)
-            messagebox.showinfo('Undo', tr('undo_result', removed=result['removed'],
-                                restored=result['restored'], errors=len(result['errors']),
-                                details='\n'.join(result['errors'][:5])))
+            self.show(tr('undo_result', removed=result['removed'], restored=result['restored'],
+                         errors=len(result['errors']), details='\n'.join(result['errors'][:5])), 'Undo')
             self.refresh_accounts()
         except (SafetyError, OSError, ValueError) as exc:
-            messagebox.showerror(tr('undo_failed'), str(exc))
+            self.show(str(exc), tr('undo_failed'), wx.OK | wx.ICON_ERROR)
 
 
 def main():
     if '--version' in sys.argv:
         print(VERSION)
         return
-    app = TransferGUI()
-    app.mainloop()
+    app = wx.App(False)
+    TransferGUI().Show()
+    app.MainLoop()
 
 
 if __name__ == '__main__':

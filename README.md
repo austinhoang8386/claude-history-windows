@@ -8,7 +8,7 @@
 
 ## Quick start
 
-1. Install **Python 3.10 or later** from https://www.python.org/downloads/windows/ and tick **Add Python to PATH**. The source app uses Python's built-in Tkinter and has no third-party Python dependencies.
+1. Install **Python 3.10 or later** from https://www.python.org/downloads/windows/ and tick **Add Python to PATH**. The app uses wxPython (native Windows controls, readable by NVDA, JAWS and Narrator); `Start-Windows.bat` installs it with pip if missing.
 2. Extract the ZIP and double-click **`Start-Windows.bat`**.
 3. In Claude Desktop, sign in to the **source** and **destination** accounts at least once each. Open the Code tab to create session folders, if necessary.
 4. **Completely quit Claude Desktop from the system tray and close all Claude Code terminals.**

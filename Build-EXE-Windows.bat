@@ -1,6 +1,6 @@
 @echo off
 cd /d "%~dp0"
-py -3 -m pip install --upgrade pyinstaller
+py -3 -m pip install --upgrade pyinstaller wxPython
 if errorlevel 1 goto failed
 py -3 -m PyInstaller --clean --noconfirm --onefile --windowed --name ClaudeHistoryTransfer claude_history_windows.py
 if errorlevel 1 goto failed
